@@ -132,9 +132,9 @@ def download_model(filename):
 def load_classical_models():
     svm_path = download_model(SVM_FILENAME)
     rf_path = download_model(RF_FILENAME)
-    svm = joblib.load(svm_path)
-    rf = joblib.load(rf_path)
-    return svm, rf
+    svm_bundle = joblib.load(svm_path)
+    rf_bundle = joblib.load(rf_path)
+    return svm_bundle, rf_bundle
 
 
 @st.cache_resource
@@ -239,10 +239,69 @@ def label_from_prediction(pred):
     return str(value)
 
 
-def classical_prediction(model, image):
+def _find_predictor(obj):
+    """Find the real sklearn estimator when joblib contains a dictionary/bundle."""
+    if hasattr(obj, "predict"):
+        return obj
+
+    if isinstance(obj, dict):
+        preferred = (
+            "model", "classifier", "estimator", "pipeline",
+            "svm", "svm_model", "rf", "rf_model",
+            "random_forest", "random_forest_model"
+        )
+        for key in preferred:
+            if key in obj:
+                found = _find_predictor(obj[key])
+                if found is not None:
+                    return found
+        for value in obj.values():
+            found = _find_predictor(value)
+            if found is not None:
+                return found
+
+    if isinstance(obj, (list, tuple)):
+        for value in obj:
+            found = _find_predictor(value)
+            if found is not None:
+                return found
+
+    return None
+
+
+def _find_transformers(obj):
+    """Recover optional preprocessing objects stored beside a classifier."""
+    if not isinstance(obj, dict):
+        return []
+
+    transformers = []
+    for key in ("scaler", "standard_scaler", "pca", "transformer", "preprocessor"):
+        value = obj.get(key)
+        if value is not None and hasattr(value, "transform"):
+            transformers.append(value)
+    return transformers
+
+
+def _unwrap_classical_bundle(bundle):
+    model = _find_predictor(bundle)
+    if model is None:
+        raise TypeError(
+            "Le fichier du modèle classique a bien été chargé, mais aucun estimateur "
+            "scikit-learn avec predict() n'a été trouvé dans son contenu."
+        )
+    transformers = _find_transformers(bundle)
+    return model, transformers
+
+
+def classical_prediction(bundle, image):
+    model, transformers = _unwrap_classical_bundle(bundle)
+
     gray = prepare_gray(image)
     features, hog_info = extract_hog_for_model(gray, model)
     X = features.reshape(1, -1)
+
+    for transformer in transformers:
+        X = transformer.transform(X)
 
     prediction = model.predict(X)[0]
     label = label_from_prediction(prediction)
@@ -257,24 +316,59 @@ def classical_prediction(model, image):
     return label, probability, hog_info
 
 
+def _resnet_input_shape(model):
+    """Read the saved Keras model input shape instead of assuming 224x224x3."""
+    shape = getattr(model, "input_shape", None)
+    if isinstance(shape, list):
+        shape = shape[0]
+    if shape is None and getattr(model, "inputs", None):
+        shape = tuple(model.inputs[0].shape)
+    if shape is None or len(shape) != 4:
+        raise ValueError(f"Forme d'entrée Keras non prise en charge : {shape}")
+
+    _, h, w, c = [int(x) if x is not None else None for x in shape]
+    if h is None or w is None or c is None:
+        raise ValueError(f"Le modèle possède une forme d'entrée dynamique non exploitable : {shape}")
+    return h, w, c
+
+
 def resnet_prediction(model, image):
     import tensorflow as tf
 
-    # Exact ResNet50 training preprocessing: 224x224, grayscale duplicated
-    # into 3 channels, then Keras ResNet50 preprocess_input.
-    gray = ImageOps.exif_transpose(image).convert("L")
-    gray = gray.resize(RESNET_SIZE)
-    arr = np.asarray(gray, dtype=np.float32)
-    rgb = np.stack([arr, arr, arr], axis=-1)
-    x = np.expand_dims(rgb, axis=0)
-    x = tf.keras.applications.resnet50.preprocess_input(x)
+    h, w, channels = _resnet_input_shape(model)
 
+    gray = ImageOps.exif_transpose(image).convert("L")
+    gray = gray.resize((w, h))
+    arr = np.asarray(gray, dtype=np.float32)
+
+    if channels == 1:
+        x = arr[..., None]
+    elif channels == 3:
+        # Match the documented ResNet50 preprocessing used in the thesis.
+        rgb = np.stack([arr, arr, arr], axis=-1)
+        x = tf.keras.applications.resnet50.preprocess_input(rgb)
+    else:
+        raise ValueError(
+            f"Le modèle attend {channels} canaux. L'application prend en charge 1 ou 3 canaux."
+        )
+
+    x = np.expand_dims(x, axis=0).astype(np.float32)
     output = model.predict(x, verbose=0)
-    score = float(np.asarray(output).reshape(-1)[0])
-    probability_pd = score if 0 <= score <= 1 else 1 / (1 + np.exp(-score))
+    values = np.asarray(output).reshape(-1)
+
+    if values.size == 1:
+        score = float(values[0])
+        probability_pd = score if 0 <= score <= 1 else 1 / (1 + np.exp(-score))
+    elif values.size == 2:
+        # Training convention in the project: class 0 = PD Patients, class 1 = Non PD Patients.
+        probs = tf.nn.softmax(values).numpy()
+        probability_pd = float(probs[0])
+    else:
+        raise ValueError(f"Sortie du modèle inattendue : {values.size} valeurs.")
+
     label = "Parkinson" if probability_pd >= 0.5 else "Non-Parkinson"
     confidence = probability_pd if label == "Parkinson" else 1 - probability_pd
-    return label, float(confidence), float(probability_pd)
+    return label, float(confidence), float(probability_pd), (h, w, channels)
 
 
 # -----------------------------
@@ -449,15 +543,14 @@ elif page == "Analyse IRM":
 
                         else:
                             resnet = load_resnet()
-                            label, confidence, _ = resnet_prediction(resnet, image)
+                            label, confidence, _, input_shape = resnet_prediction(resnet, image)
 
                             st.markdown("### Résultat")
                             st.success(f"Classification : **{label}**")
                             st.metric("Confiance du modèle", f"{confidence * 100:.2f}%")
 
                             st.caption(
-                                "Le prétraitement ResNet50 est 224×224, niveaux de gris dupliqués sur 3 canaux, "
-                                "puis preprocess_input."
+                                f"Entrée du modèle : {input_shape[0]}×{input_shape[1]}×{input_shape[2]} ; prétraitement adapté à la forme réelle du modèle."
                             )
 
                 except Exception as e:
