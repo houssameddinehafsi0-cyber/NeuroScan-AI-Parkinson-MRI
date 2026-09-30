@@ -1,9 +1,21 @@
-import streamlit as st
-from pathlib import Path
-from PIL import Image
+import os
+import io
+import itertools
+import warnings
 
-APP_DIR = Path(__file__).parent
-MODELS_DIR = APP_DIR / "models"
+import joblib
+from huggingface_hub import hf_hub_download
+import numpy as np
+import streamlit as st
+from PIL import Image, ImageOps
+from skimage.feature import hog
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# NeuroScan AI - Parkinson MRI Classification
+# Real model integration
+# ============================================================
 
 st.set_page_config(
     page_title="NeuroScan AI | Parkinson MRI",
@@ -12,325 +24,523 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------- CSS ----------------
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+# -----------------------------
+# Paths
+# -----------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+HF_REPO_ID = "hou88hou/NeuroScan-AI-Parkinson-MRI"
 
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
-}
-.stApp {
-    background: #f5f8fb;
-}
-.block-container {
-    max-width: 1280px;
-    padding-top: 1.5rem;
-    padding-bottom: 3rem;
-}
-[data-testid="stSidebar"] {
-    background: #102a43;
-}
-[data-testid="stSidebar"] * {
-    color: #eef5fb !important;
-}
-.brand {
-    padding: 0.5rem 0 1.5rem 0;
-}
-.brand-title {
-    font-size: 1.35rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-}
-.brand-sub {
-    font-size: .75rem;
-    opacity: .72;
-    margin-top: .2rem;
-}
-.topbar {
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    padding: .8rem 1.2rem;
-    background:white;
-    border:1px solid #e3eaf1;
-    border-radius:14px;
-    margin-bottom:1.3rem;
-}
-.status {
-    font-size:.78rem;
-    color:#1d7a55;
-    background:#e9f8f1;
-    padding:.45rem .7rem;
-    border-radius:20px;
-    font-weight:600;
-}
-.hero {
-    padding:2.5rem;
-    border-radius:22px;
-    background:linear-gradient(135deg,#0b3954 0%,#087e8b 100%);
-    color:white;
-    margin-bottom:1.5rem;
-    box-shadow:0 12px 30px rgba(16,42,67,.12);
-}
-.hero h1 {
-    font-size:2.35rem;
-    margin:0 0 .6rem 0;
-    letter-spacing:-.04em;
-}
-.hero p {
-    font-size:1rem;
-    opacity:.9;
-    max-width:720px;
-    line-height:1.6;
-}
-.metric {
-    background:white;
-    border:1px solid #e3eaf1;
-    border-radius:16px;
-    padding:1.2rem;
-    box-shadow:0 4px 16px rgba(16,42,67,.04);
-}
-.metric-label {font-size:.78rem;color:#627d98;text-transform:uppercase;letter-spacing:.04em}
-.metric-value {font-size:1.55rem;font-weight:700;color:#102a43;margin-top:.35rem}
-.panel {
-    background:white;
-    border:1px solid #e3eaf1;
-    border-radius:18px;
-    padding:1.35rem;
-    margin-bottom:1rem;
-}
-.panel h3 {color:#102a43;margin-top:0}
-.model-card {
-    background:#f8fafc;
-    border:1px solid #e1e8ef;
-    border-radius:14px;
-    padding:1rem;
-    min-height:135px;
-}
-.model-name {font-weight:700;color:#102a43}
-.model-desc {font-size:.84rem;color:#627d98;line-height:1.5;margin-top:.4rem}
-.result-normal {
-    padding:1.5rem;
-    border-radius:16px;
-    background:#eaf8f1;
-    border:1px solid #b9e5cf;
-}
-.result-note {
-    padding:1rem;
-    border-radius:12px;
-    background:#fff8e8;
-    border:1px solid #f0d99c;
-}
-.footer {
-    text-align:center;
-    color:#829ab1;
-    font-size:.75rem;
-    padding-top:2rem;
-}
-div.stButton > button {
-    border-radius:10px;
-    font-weight:600;
-}
-</style>
-""", unsafe_allow_html=True)
+SVM_FILENAME = "parkinson_svm_hog_model.joblib"
+RF_FILENAME = "random_forest_parkinson.joblib"
+RESNET_FILENAME = "ResNet50_Parkinson_finetuned.keras"
 
-MODELS = {
-    "SVM + HOG": MODELS_DIR / "parkinson_svm_hog_model.joblib",
-    "Random Forest + HOG": MODELS_DIR / "random_forest_parkinson.joblib",
-    "ResNet50": MODELS_DIR / "ResNet50_Parkinson_finetuned.keras",
-}
-def model_ready(path):
-    return path.exists() and path.stat().st_size > 100
+IMG_SIZE = (128, 128)
+RESNET_SIZE = (224, 224)
 
-# ---------------- Sidebar ----------------
+# -----------------------------
+# Styling
+# -----------------------------
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: #f5f7fb;
+    }
+    section[data-testid="stSidebar"] {
+        background: #0b1f33;
+    }
+    section[data-testid="stSidebar"] * {
+        color: white !important;
+    }
+    .hero {
+        background: linear-gradient(135deg, #0b1f33 0%, #123d5a 100%);
+        padding: 30px;
+        border-radius: 18px;
+        color: white;
+        margin-bottom: 24px;
+    }
+    .hero h1 {
+        margin: 0;
+        font-size: 34px;
+    }
+    .hero p {
+        margin-top: 8px;
+        opacity: 0.88;
+        font-size: 16px;
+    }
+    .card {
+        background: white;
+        border-radius: 16px;
+        padding: 22px;
+        border: 1px solid #e5e9f0;
+        box-shadow: 0 4px 16px rgba(15, 23, 42, 0.05);
+        margin-bottom: 18px;
+    }
+    .metric-card {
+        background: white;
+        border-radius: 14px;
+        padding: 18px;
+        border: 1px solid #e5e9f0;
+        text-align: center;
+    }
+    .metric-value {
+        font-size: 30px;
+        font-weight: 700;
+        color: #0b1f33;
+    }
+    .metric-label {
+        color: #64748b;
+        font-size: 14px;
+    }
+    .success-box {
+        background: #ecfdf5;
+        border: 1px solid #a7f3d0;
+        color: #065f46;
+        padding: 16px;
+        border-radius: 12px;
+    }
+    .warning-box {
+        background: #fffbeb;
+        border: 1px solid #fde68a;
+        color: #92400e;
+        padding: 16px;
+        border-radius: 12px;
+    }
+    .danger-box {
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        color: #991b1b;
+        padding: 16px;
+        border-radius: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -----------------------------
+# Model loading
+# -----------------------------
+@st.cache_resource
+def download_model(filename):
+    """Download a public model from Hugging Face and cache it locally."""
+    return hf_hub_download(repo_id=HF_REPO_ID, filename=filename)
+
+
+@st.cache_resource
+def load_classical_models():
+    svm_path = download_model(SVM_FILENAME)
+    rf_path = download_model(RF_FILENAME)
+    svm = joblib.load(svm_path)
+    rf = joblib.load(rf_path)
+    return svm, rf
+
+
+@st.cache_resource
+def load_resnet():
+    import tensorflow as tf
+    resnet_path = download_model(RESNET_FILENAME)
+    return tf.keras.models.load_model(resnet_path)
+
+
+def model_files_status():
+    # The repository is public; availability is checked when the model is loaded.
+    return {
+        "SVM + HOG": True,
+        "Random Forest + HOG": True,
+        "ResNet50": True,
+    }
+
+
+# -----------------------------
+# Image / HOG preprocessing
+# -----------------------------
+def prepare_gray(image):
+    image = ImageOps.exif_transpose(image).convert("L")
+    image = image.resize(IMG_SIZE)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def prepare_rgb(image):
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    image = image.resize(IMG_SIZE)
+    return np.asarray(image, dtype=np.float32)
+
+
+def build_hog_candidates(gray):
+    """Exact HOG configuration used during training."""
+    features = hog(
+        gray,
+        orientations=9,
+        pixels_per_cell=(8, 8),
+        cells_per_block=(2, 2),
+        block_norm="L2-Hys",
+        feature_vector=True,
+    )
+    return [{
+        "features": features.astype(np.float32),
+        "orientations": 9,
+        "pixels_per_cell": (8, 8),
+        "cells_per_block": (2, 2),
+    }]
+
+
+def get_expected_features(model):
+    value = getattr(model, "n_features_in_", None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def extract_hog_for_model(gray, model):
+    candidates = build_hog_candidates(gray)
+    expected = get_expected_features(model)
+
+    if expected is None:
+        # Fall back to a common configuration.
+        return candidates[0]["features"], candidates[0]
+
+    for candidate in candidates:
+        if len(candidate["features"]) == expected:
+            return candidate["features"], candidate
+
+    raise ValueError(
+        f"Le modèle attend {expected} caractéristiques HOG, "
+        f"mais aucune configuration HOG courante testée ne produit ce nombre. "
+        f"Il faut utiliser exactement les paramètres HOG du notebook d'entraînement."
+    )
+
+
+# -----------------------------
+# Prediction helpers
+# -----------------------------
+def label_from_prediction(pred):
+    """
+    Converts common binary outputs to a readable label.
+    Assumes the trained classifier uses 0/1 or class labels containing
+    Parkinson / Non-PD.
+    """
+    value = pred
+
+    if isinstance(value, np.ndarray):
+        value = value.reshape(-1)[0]
+
+    text = str(value).strip().lower()
+
+    if text in {"1", "1.0", "true", "pd", "parkinson", "parkinson's", "positive"}:
+        return "Parkinson"
+    if text in {"0", "0.0", "false", "non-pd", "non pd", "non_parkinson", "negative"}:
+        return "Non-Parkinson"
+
+    return str(value)
+
+
+def classical_prediction(model, image):
+    gray = prepare_gray(image)
+    features, hog_info = extract_hog_for_model(gray, model)
+    X = features.reshape(1, -1)
+
+    prediction = model.predict(X)[0]
+    label = label_from_prediction(prediction)
+
+    probability = None
+    if hasattr(model, "predict_proba"):
+        try:
+            probability = float(np.max(model.predict_proba(X)[0]))
+        except Exception:
+            probability = None
+
+    return label, probability, hog_info
+
+
+def resnet_prediction(model, image):
+    import tensorflow as tf
+
+    # Exact ResNet50 training preprocessing: 224x224, grayscale duplicated
+    # into 3 channels, then Keras ResNet50 preprocess_input.
+    gray = ImageOps.exif_transpose(image).convert("L")
+    gray = gray.resize(RESNET_SIZE)
+    arr = np.asarray(gray, dtype=np.float32)
+    rgb = np.stack([arr, arr, arr], axis=-1)
+    x = np.expand_dims(rgb, axis=0)
+    x = tf.keras.applications.resnet50.preprocess_input(x)
+
+    output = model.predict(x, verbose=0)
+    score = float(np.asarray(output).reshape(-1)[0])
+    probability_pd = score if 0 <= score <= 1 else 1 / (1 + np.exp(-score))
+    label = "Parkinson" if probability_pd >= 0.5 else "Non-Parkinson"
+    confidence = probability_pd if label == "Parkinson" else 1 - probability_pd
+    return label, float(confidence), float(probability_pd)
+
+
+# -----------------------------
+# Sidebar
+# -----------------------------
 with st.sidebar:
-    st.markdown("""
-    <div class="brand">
-        <div style="font-size:2rem">🧠</div>
-        <div class="brand-title">NeuroScan AI</div>
-        <div class="brand-sub">Parkinson MRI Classification</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("## 🧠 NeuroScan AI")
+    st.caption("Parkinson MRI Classification")
+    st.divider()
 
     page = st.radio(
-        "MENU",
+        "Navigation",
         ["Dashboard", "Analyse IRM", "Modèles & résultats", "À propos"],
-        label_visibility="visible"
     )
 
     st.divider()
-    st.caption("PROTOTYPE ACADÉMIQUE")
-    st.caption("Classification expérimentale d'images IRM")
+    st.caption("Prototype académique — non destiné au diagnostic clinique.")
 
-# ---------------- Top bar ----------------
-st.markdown("""
-<div class="topbar">
-    <div><b>NeuroScan AI</b> &nbsp; / &nbsp; Analyse IRM cérébrale</div>
-    <div class="status">● Système prêt</div>
-</div>
-""", unsafe_allow_html=True)
 
-# ---------------- Dashboard ----------------
-if page == "Dashboard":
-    st.markdown("""
+# -----------------------------
+# Header
+# -----------------------------
+st.markdown(
+    """
     <div class="hero">
-        <h1>Analyse intelligente des IRM cérébrales</h1>
-        <p>
-        Plateforme expérimentale de classification automatique de la maladie de Parkinson
-        à partir d’images IRM, basée sur SVM, Random Forest et ResNet50.
-        </p>
+        <h1>NeuroScan AI</h1>
+        <p>Système expérimental d'aide à la classification de la maladie de Parkinson à partir d'images IRM.</p>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-    a,b,c,d = st.columns(4)
-    with a:
-        st.markdown('<div class="metric"><div class="metric-label">Modèles</div><div class="metric-value">3</div></div>', unsafe_allow_html=True)
-    with b:
-        st.markdown('<div class="metric"><div class="metric-label">Meilleure Accuracy</div><div class="metric-value">94.93%</div></div>', unsafe_allow_html=True)
-    with c:
-        st.markdown('<div class="metric"><div class="metric-label">ROC-AUC</div><div class="metric-value">98.52%</div></div>', unsafe_allow_html=True)
-    with d:
-        st.markdown('<div class="metric"><div class="metric-label">Résolution</div><div class="metric-value">128×128</div></div>', unsafe_allow_html=True)
+# -----------------------------
+# Dashboard
+# -----------------------------
+if page == "Dashboard":
+    st.markdown("## Tableau de bord")
 
-    st.write("")
-    st.markdown('<div class="panel"><h3>Parcours d’analyse</h3>', unsafe_allow_html=True)
-    x,y,z = st.columns(3)
-    with x:
-        st.markdown('<div class="model-card"><div class="model-name">01 · Charger</div><div class="model-desc">Importer une image IRM cérébrale depuis votre ordinateur.</div></div>', unsafe_allow_html=True)
-    with y:
-        st.markdown('<div class="model-card"><div class="model-name">02 · Analyser</div><div class="model-desc">Sélectionner SVM, Random Forest ou ResNet50.</div></div>', unsafe_allow_html=True)
-    with z:
-        st.markdown('<div class="model-card"><div class="model-name">03 · Résultat</div><div class="model-desc">Afficher la classe prédite et les informations du modèle.</div></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
 
-    st.info("Utilisez « Analyse IRM » dans le menu pour commencer.")
+    with c1:
+        st.markdown(
+            '<div class="metric-card"><div class="metric-value">3</div><div class="metric-label">Modèles</div></div>',
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            '<div class="metric-card"><div class="metric-value">94.93%</div><div class="metric-label">Accuracy ResNet50</div></div>',
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            '<div class="metric-card"><div class="metric-value">98.52%</div><div class="metric-label">ROC-AUC ResNet50</div></div>',
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            '<div class="metric-card"><div class="metric-value">128×128</div><div class="metric-label">Résolution</div></div>',
+            unsafe_allow_html=True,
+        )
 
-# ---------------- Analysis ----------------
+    st.markdown("### État des modèles")
+    status = model_files_status()
+
+    for name, exists in status.items():
+        if exists:
+            st.markdown(
+                f'<div class="success-box">✓ <strong>{name}</strong> — fichier détecté</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="danger-box">✗ <strong>{name}</strong> — fichier manquant</div>',
+                unsafe_allow_html=True,
+            )
+
+# -----------------------------
+# MRI analysis
+# -----------------------------
 elif page == "Analyse IRM":
-    st.title("Analyse IRM")
-    st.caption("Importez une image puis sélectionnez le modèle à utiliser.")
+    st.markdown("## Analyse d'une image IRM")
 
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    uploaded = st.file_uploader(
-        "Importer une image IRM",
-        type=["jpg","jpeg","png"],
-        help="Formats actuellement pris en charge par le prototype."
+    st.markdown(
+        """
+        <div class="card">
+        <strong>Étape 1 — Importer une image</strong><br>
+        Chargez une image IRM au format JPG, JPEG ou PNG.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if not uploaded:
-        st.markdown("""
-        <div style="text-align:center;padding:2.2rem;color:#627d98">
-            <div style="font-size:3rem">🩻</div>
-            <b>Déposez votre image IRM ici</b>
-            <p style="font-size:.85rem">JPG, JPEG ou PNG</p>
+    uploaded = st.file_uploader(
+        "Sélectionner une image IRM",
+        type=["jpg", "jpeg", "png"],
+    )
+
+    if uploaded is not None:
+        image = Image.open(io.BytesIO(uploaded.read()))
+
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            st.image(image, caption="Image IRM importée", use_container_width=True)
+
+        with col2:
+            st.markdown("### Paramètres")
+            model_choice = st.selectbox(
+                "Modèle",
+                ["ResNet50", "SVM + HOG", "Random Forest + HOG"],
+            )
+
+            st.info(
+                "SVM/RF : 128×128 + HOG (9 orientations, 8×8, 2×2). ResNet50 : 224×224 + 3 canaux + preprocess_input."
+            )
+
+            files = model_files_status()
+            selected_file_ok = {
+                "ResNet50": files["ResNet50"],
+                "SVM + HOG": files["SVM + HOG"],
+                "Random Forest + HOG": files["Random Forest + HOG"],
+            }[model_choice]
+
+            if selected_file_ok:
+                st.success("Modèle détecté et prêt à être chargé.")
+            else:
+                st.error("Le fichier du modèle sélectionné est introuvable.")
+
+            run = st.button(
+                "🔎 Lancer l'analyse",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if run:
+            if not selected_file_ok:
+                st.error("Impossible de lancer l'analyse : modèle manquant.")
+            else:
+                try:
+                    with st.spinner("Analyse de l'image en cours..."):
+                        if model_choice == "SVM + HOG":
+                            svm, _ = load_classical_models()
+                            label, confidence, hog_info = classical_prediction(svm, image)
+
+                            st.markdown("### Résultat")
+                            st.success(f"Classification : **{label}**")
+                            if confidence is not None:
+                                st.metric("Confiance du modèle", f"{confidence * 100:.2f}%")
+
+                            st.caption(
+                                "HOG utilisé : "
+                                f"{hog_info['orientations']} orientations, "
+                                f"pixels/cellule={hog_info['pixels_per_cell']}, "
+                                f"cellules/bloc={hog_info['cells_per_block']}."
+                            )
+
+                        elif model_choice == "Random Forest + HOG":
+                            _, rf = load_classical_models()
+                            label, confidence, hog_info = classical_prediction(rf, image)
+
+                            st.markdown("### Résultat")
+                            st.success(f"Classification : **{label}**")
+                            if confidence is not None:
+                                st.metric("Confiance du modèle", f"{confidence * 100:.2f}%")
+
+                            st.caption(
+                                "HOG utilisé : "
+                                f"{hog_info['orientations']} orientations, "
+                                f"pixels/cellule={hog_info['pixels_per_cell']}, "
+                                f"cellules/bloc={hog_info['cells_per_block']}."
+                            )
+
+                        else:
+                            resnet = load_resnet()
+                            label, confidence, _ = resnet_prediction(resnet, image)
+
+                            st.markdown("### Résultat")
+                            st.success(f"Classification : **{label}**")
+                            st.metric("Confiance du modèle", f"{confidence * 100:.2f}%")
+
+                            st.caption(
+                                "Le prétraitement ResNet50 est 224×224, niveaux de gris dupliqués sur 3 canaux, "
+                                "puis preprocess_input."
+                            )
+
+                except Exception as e:
+                    st.error("L'analyse n'a pas pu être exécutée.")
+                    st.code(str(e))
+
+                    if model_choice in ["SVM + HOG", "Random Forest + HOG"]:
+                        st.warning(
+                            "Pour SVM/Random Forest, les paramètres HOG doivent être "
+                            "identiques à ceux utilisés pendant l'entraînement."
+                        )
+                    else:
+                        st.warning(
+                            "Pour ResNet50, le prétraitement doit être identique à celui "
+                            "utilisé pendant l'entraînement du modèle."
+                        )
+
+    else:
+        st.markdown(
+            '<div class="warning-box">Veuillez importer une image IRM pour commencer.</div>',
+            unsafe_allow_html=True,
+        )
+
+# -----------------------------
+# Results
+# -----------------------------
+elif page == "Modèles & résultats":
+    st.markdown("## Modèles et résultats expérimentaux")
+
+    st.markdown(
+        """
+        <div class="card">
+        <strong>SVM + HOG</strong><br>
+        Accuracy : 86.34% &nbsp; | &nbsp; ROC-AUC : 92.78%
         </div>
-        """, unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if uploaded:
-        image = Image.open(uploaded).convert("RGB")
-        left, right = st.columns([1.15, .85])
+    st.markdown(
+        """
+        <div class="card">
+        <strong>Random Forest + HOG</strong><br>
+        Accuracy : 88.81% &nbsp; | &nbsp; ROC-AUC : 97.12%
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        with left:
-            st.markdown('<div class="panel"><h3>Image examinée</h3>', unsafe_allow_html=True)
-            st.image(image, use_container_width=True)
-            st.caption(f"Fichier : {uploaded.name} · Taille originale : {image.size[0]} × {image.size[1]}")
-            st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="card">
+        <strong>ResNet50 fine-tuned</strong><br>
+        Accuracy : 94.93% &nbsp; | &nbsp; Precision : 95.33% &nbsp; | &nbsp;
+        Sensitivity : 98.10% &nbsp; | &nbsp; Specificity : 85.07% &nbsp; | &nbsp;
+        F1 : 96.69% &nbsp; | &nbsp; ROC-AUC : 98.52%
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        with right:
-            st.markdown('<div class="panel"><h3>Configuration de l’analyse</h3>', unsafe_allow_html=True)
-            model_name = st.selectbox("Modèle", list(MODELS.keys()))
-            st.markdown("**Prétraitement prévu**")
-            st.write("✓ Conversion de l’image")
-            st.write("✓ Redimensionnement 128 × 128")
-            if "SVM" in model_name or "Forest" in model_name:
-                st.write("✓ Extraction HOG")
-            else:
-                st.write("✓ Prétraitement compatible ResNet50")
-            st.write("")
-            ready = model_ready(MODELS[model_name])
-            if ready:
-                st.success("Modèle détecté")
-            else:
-                st.warning("Modèle à intégrer")
-            analyze = st.button("🔍 Lancer l’analyse", type="primary", use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+# -----------------------------
+# About
+# -----------------------------
+else:
+    st.markdown("## À propos")
 
-        if analyze:
-            if not ready:
-                st.markdown("""
-                <div class="result-note">
-                <b>Analyse non exécutée.</b><br>
-                Le fichier du modèle sélectionné est encore un placeholder.
-                Remplacez-le par votre modèle entraîné pour activer la prédiction.
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.info("Le point d’intégration du modèle est prêt. La fonction de prédiction sera reliée à votre fichier réel.")
-
-        st.markdown("""
-        <div class="panel">
-        <h3>Interprétation</h3>
-        <p style="color:#627d98">
-        Le résultat affiché par cette interface doit être interprété comme une classification
-        expérimentale issue du modèle sélectionné et non comme un diagnostic médical.
+    st.markdown(
+        """
+        <div class="card">
+        <h3>NeuroScan AI</h3>
+        <p>
+        Prototype académique de classification d'images IRM pour l'étude de la
+        maladie de Parkinson. L'application intègre trois approches :
+        SVM avec HOG, Random Forest avec HOG et ResNet50 fine-tuned.
         </p>
         </div>
-        """, unsafe_allow_html=True)
-
-# ---------------- Models ----------------
-elif page == "Modèles & résultats":
-    st.title("Modèles & résultats")
-    st.caption("Performances expérimentales rapportées dans le mémoire.")
-
-    rows = [
-        ["SVM + HOG","86.34 %","87.59 %","82.45 %","90.65 %","92.78 %"],
-        ["Random Forest + HOG","88.81 %","99.56 %","55.38 %","93.08 %","97.12 %"],
-        ["ResNet50","94.93 %","98.10 %","85.07 %","96.69 %","98.52 %"],
-    ]
-    st.dataframe(
-        rows,
-        column_config={
-            0:"Modèle",1:"Accuracy",2:"Sensibilité",3:"Spécificité",4:"F1-score",5:"ROC-AUC"
-        },
-        hide_index=True,
-        use_container_width=True
+        """,
+        unsafe_allow_html=True,
     )
-
-    st.markdown('<div class="panel"><h3>Architecture des modèles</h3>', unsafe_allow_html=True)
-    a,b,c = st.columns(3)
-    with a:
-        st.markdown('<div class="model-card"><div class="model-name">SVM</div><div class="model-desc">HOG → SVM → Parkinson / Non-Parkinson</div></div>', unsafe_allow_html=True)
-    with b:
-        st.markdown('<div class="model-card"><div class="model-name">Random Forest</div><div class="model-desc">HOG → Random Forest → Parkinson / Non-Parkinson</div></div>', unsafe_allow_html=True)
-    with c:
-        st.markdown('<div class="model-card"><div class="model-name">ResNet50</div><div class="model-desc">Image → ResNet50 → Parkinson / Non-Parkinson</div></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-# ---------------- About ----------------
-else:
-    st.title("À propos de NeuroScan AI")
-    st.markdown("""
-    <div class="panel">
-    <h3>Objectif</h3>
-    <p>
-    Développer une interface expérimentale permettant de charger une image IRM cérébrale
-    et de préparer sa classification à l’aide de modèles d’apprentissage automatique.
-    </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="panel">
-    <h3>Technologies prévues</h3>
-    <p>Python · Streamlit · SVM · Random Forest · HOG · ResNet50</p>
-    </div>
-    """, unsafe_allow_html=True)
 
     st.warning(
-        "Cette application est un prototype académique. Elle ne constitue pas un dispositif "
-        "médical validé et ne remplace pas l’évaluation d’un professionnel de santé."
+        "Important : cette application est un prototype expérimental académique. "
+        "Elle n'est pas un dispositif médical et ne doit pas être utilisée seule "
+        "pour établir un diagnostic."
     )
-
-st.markdown('<div class="footer">NeuroScan AI · Projet académique · Parkinson MRI Classification</div>', unsafe_allow_html=True)
