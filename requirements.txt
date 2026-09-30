@@ -1,7 +1,8 @@
-streamlit>=1.40
-pillow>=10.0
-numpy>=1.26
-joblib>=1.4
-scikit-learn>=1.4
-scikit-image>=0.22
-tensorflow>=2.15
+streamlit
+numpy
+pillow
+joblib
+scikit-image
+scikit-learn
+huggingface_hub
+tensorflow
